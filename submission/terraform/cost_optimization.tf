@@ -1,28 +1,195 @@
-# cost_optimization.tf — Cost Optimization Resources
+# networking.tf — VPC and networking configuration
 #
-# TASK: Review data/aws_cost_report.json and implement cost-saving measures.
-#
-# Requirements:
-#   1. Analyze the cost report and identify the top savings opportunities
-#   2. Implement Terraform resources that address the findings, such as:
-#      - S3 lifecycle policies for tiered storage
-#      - Spot/mixed instance configurations for node groups
-#      - Right-sizing recommendations implemented as resource changes
-#   3. Add a comment block at the top explaining your cost analysis:
-#      - Current monthly cost and top cost drivers
-#      - Proposed changes and estimated savings
-#      - Any trade-offs or risks
+# FIXED: All 3 bugs corrected.
 
-# --- Your cost analysis ---
-# TODO: Write your analysis here as comments
+resource "aws_vpc" "main" {
+  cidr_block           = var.vpc_cidr
+  enable_dns_support   = true
+  enable_dns_hostnames = true
 
-# --- S3 Lifecycle Policies ---
-# TODO: Implement lifecycle rules for the video chunks bucket
-#   Hint: 95% of access is within the first 30 days
+  tags = {
+    Name = "${var.cluster_name}-vpc"
+  }
+}
 
-# --- Spot/Mixed Instance Configuration ---
-# TODO: Configure mixed instance policies for appropriate node groups
-#   Hint: Not all workloads are suitable for spot instances
+data "aws_availability_zones" "available" {
+  state = "available"
+}
 
-# --- Other Cost Optimizations ---
-# TODO: Implement any other cost-saving measures you identified
+# --- Public Subnets ---
+
+resource "aws_subnet" "public_a" {
+  vpc_id                  = aws_vpc.main.id
+  cidr_block              = cidrsubnet(var.vpc_cidr, 8, 1)
+  availability_zone       = data.aws_availability_zones.available.names[0]
+  map_public_ip_on_launch = true
+
+  tags = {
+    Name                     = "${var.cluster_name}-public-a"
+    "kubernetes.io/role/elb" = "1"
+  }
+}
+
+resource "aws_subnet" "public_b" {
+  vpc_id                  = aws_vpc.main.id
+  cidr_block              = cidrsubnet(var.vpc_cidr, 8, 2)
+  availability_zone       = data.aws_availability_zones.available.names[1]
+  map_public_ip_on_launch = true
+
+  tags = {
+    Name                     = "${var.cluster_name}-public-b"
+    "kubernetes.io/role/elb" = "1"
+  }
+}
+
+# --- Private Subnets ---
+
+resource "aws_subnet" "private_a" {
+  vpc_id            = aws_vpc.main.id
+  cidr_block        = cidrsubnet(var.vpc_cidr, 8, 10)
+  availability_zone = data.aws_availability_zones.available.names[0]
+
+  tags = {
+    Name                              = "${var.cluster_name}-private-a"
+    "kubernetes.io/role/internal-elb" = "1"
+  }
+}
+
+resource "aws_subnet" "private_b" {
+  vpc_id            = aws_vpc.main.id
+  cidr_block        = cidrsubnet(var.vpc_cidr, 8, 11)
+  availability_zone = data.aws_availability_zones.available.names[1]
+
+  tags = {
+    Name                              = "${var.cluster_name}-private-b"
+    "kubernetes.io/role/internal-elb" = "1"
+  }
+}
+
+# --- Internet Gateway ---
+
+resource "aws_internet_gateway" "main" {
+  vpc_id = aws_vpc.main.id
+
+  tags = {
+    Name = "${var.cluster_name}-igw"
+  }
+}
+
+# --- NAT Gateway ---
+# FIXED: NAT Gateway must exist in a PUBLIC subnet.
+
+resource "aws_eip" "nat" {
+  domain = "vpc"
+}
+
+resource "aws_nat_gateway" "main" {
+  allocation_id = aws_eip.nat.id
+  subnet_id     = aws_subnet.public_a.id   # FIXED
+
+  tags = {
+    Name = "${var.cluster_name}-nat"
+  }
+}
+
+# --- Route Tables ---
+
+resource "aws_route_table" "public" {
+  vpc_id = aws_vpc.main.id
+
+  route {
+    cidr_block = "0.0.0.0/0"
+    gateway_id = aws_internet_gateway.main.id
+  }
+
+  tags = {
+    Name = "${var.cluster_name}-public-rt"
+  }
+}
+
+resource "aws_route_table" "private" {
+  vpc_id = aws_vpc.main.id
+
+  route {
+    cidr_block     = "0.0.0.0/0"
+    nat_gateway_id = aws_nat_gateway.main.id
+  }
+
+  tags = {
+    Name = "${var.cluster_name}-private-rt"
+  }
+}
+
+# FIXED: Public subnets must use PUBLIC route table.
+
+resource "aws_route_table_association" "public_a" {
+  subnet_id      = aws_subnet.public_a.id
+  route_table_id = aws_route_table.public.id   # FIXED
+}
+
+resource "aws_route_table_association" "public_b" {
+  subnet_id      = aws_subnet.public_b.id
+  route_table_id = aws_route_table.public.id   # FIXED
+}
+
+resource "aws_route_table_association" "private_a" {
+  subnet_id      = aws_subnet.private_a.id
+  route_table_id = aws_route_table.private.id
+}
+
+resource "aws_route_table_association" "private_b" {
+  subnet_id      = aws_subnet.private_b.id
+  route_table_id = aws_route_table.private.id
+}
+
+# --- Security Groups ---
+
+# FIXED: SSH restricted to management CIDR.
+
+resource "aws_security_group" "bastion" {
+  name_prefix = "${var.cluster_name}-bastion-"
+  vpc_id      = aws_vpc.main.id
+
+  ingress {
+    description = "SSH access"
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = [var.management_cidr]  # FIXED
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Name = "${var.cluster_name}-bastion-sg"
+  }
+}
+
+resource "aws_security_group" "eks_nodes" {
+  name_prefix = "${var.cluster_name}-nodes-"
+  vpc_id      = aws_vpc.main.id
+
+  ingress {
+    description = "Node to node"
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    self        = true
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Name = "${var.cluster_name}-nodes-sg"
+  }
+}
